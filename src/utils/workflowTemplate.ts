@@ -1,0 +1,181 @@
+export const WORKFLOW_YML_TEMPLATE = `name: 0-RAM WebDAV Video Chopper
+
+on:
+  repository_dispatch:
+    types: [chop-video]
+  workflow_dispatch:
+    inputs:
+      video_filename:
+        description: 'Input video filename inside /input/ (e.g. sample.mp4)'
+        required: true
+        default: 'video.mp4'
+      clips_json:
+        description: 'JSON array of clips with start, end, and title'
+        required: true
+        default: '[{"start":"00:00:10.000","end":"00:00:30.000","title":"highlight_1"}]'
+
+jobs:
+  chop_and_upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up FFmpeg & jq & curl
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg jq curl
+
+      - name: Parse Dispatch Inputs
+        id: params
+        run: |
+          # Read from repository_dispatch client_payload OR workflow_dispatch inputs
+          if [ -n "\${{ github.event.client_payload.video_filename }}" ]; then
+            VIDEO_NAME="\${{ github.event.client_payload.video_filename }}"
+            CLIPS_JSON='\${{ toJson(github.event.client_payload.clips) }}'
+            KOOFR_BASE_URL="\${{ github.event.client_payload.koofr_base_url }}"
+            KOOFR_USER="\${{ github.event.client_payload.koofr_username }}"
+            KOOFR_PASS="\${{ github.event.client_payload.koofr_app_password }}"
+          else
+            VIDEO_NAME="\${{ github.event.inputs.video_filename }}"
+            CLIPS_JSON='\${{ github.event.inputs.clips_json }}'
+            KOOFR_BASE_URL=""
+            KOOFR_USER=""
+            KOOFR_PASS=""
+          fi
+
+          # Fallback to GitHub Secrets if not in payload
+          if [ -z "$KOOFR_BASE_URL" ]; then
+            KOOFR_BASE_URL="\${{ secrets.KOOFR_BASE_URL }}"
+          fi
+          if [ -z "$KOOFR_USER" ]; then
+            KOOFR_USER="\${{ secrets.KOOFR_USERNAME }}"
+          fi
+          if [ -z "$KOOFR_PASS" ]; then
+            KOOFR_PASS="\${{ secrets.KOOFR_APP_PASSWORD }}"
+          fi
+
+          # Strip trailing slash from base url
+          KOOFR_BASE_URL=\${KOOFR_BASE_URL%/}
+
+          echo "video_name=$VIDEO_NAME" >> $GITHUB_OUTPUT
+          echo "koofr_base_url=$KOOFR_BASE_URL" >> $GITHUB_OUTPUT
+          echo "::add-mask::$KOOFR_PASS"
+          echo "::add-mask::$KOOFR_USER"
+
+          # Save clips to file
+          echo "$CLIPS_JSON" > clips.json
+          echo "Target Video: $VIDEO_NAME"
+          cat clips.json
+
+      - name: Download Video from Koofr WebDAV
+        env:
+          KOOFR_USER: \${{ secrets.KOOFR_USERNAME || github.event.client_payload.koofr_username }}
+          KOOFR_PASS: \${{ secrets.KOOFR_APP_PASSWORD || github.event.client_payload.koofr_app_password }}
+        run: |
+          BASE_URL="\${{ steps.params.outputs.koofr_base_url }}"
+          VIDEO_NAME="\${{ steps.params.outputs.video_name }}"
+          
+          mkdir -p workspace/clips
+          cd workspace
+
+          # Download video from /input/
+          INPUT_URL="$BASE_URL/input/$VIDEO_NAME"
+          echo "Downloading from: $INPUT_URL"
+          
+          curl -f -u "$KOOFR_USER:$KOOFR_PASS" -o "source_video.mp4" "$INPUT_URL"
+          
+          echo "Downloaded source file size:"
+          ls -lh source_video.mp4
+
+      - name: Stream-Copy FFmpeg Chopping (Zero-RAM, Instant Cut)
+        run: |
+          cd workspace
+          VIDEO_NAME="\${{ steps.params.outputs.video_name }}"
+          # Extract clean basename without extension
+          BASENAME=\${VIDEO_NAME%.*}
+
+          echo "Processing clips with FFmpeg stream copying (-c copy)..."
+          
+          # Iterate over each clip item in clips.json
+          CLIP_COUNT=$(jq '. | length' ../clips.json)
+          echo "Total clips to generate: $CLIP_COUNT"
+
+          for i in $(seq 0 $(($CLIP_COUNT - 1))); do
+            START=$(jq -r ".[$i].startFormatted // .[$i].start" ../clips.json)
+            END=$(jq -r ".[$i].endFormatted // .[$i].end" ../clips.json)
+            TITLE=$(jq -r ".[$i].title" ../clips.json | tr -dc '[:alnum:]_ -' | tr ' ' '_')
+            
+            INDEX=$((i + 1))
+            OUT_FILE="clips/clip_\${INDEX}_\${TITLE}.mp4"
+            
+            echo "--- Clipping #$INDEX: [$START -> $END] => $OUT_FILE ---"
+            
+            # Use -ss before -i and -to for ultrafast keyframe seeking + stream copy
+            ffmpeg -y -ss "$START" -to "$END" -i source_video.mp4 -c copy -avoid_negative_ts make_zero "$OUT_FILE"
+          done
+
+          echo "Generated clips list:"
+          ls -lh clips/
+
+      - name: Ensure Destination WebDAV Directory & Upload Clips
+        env:
+          KOOFR_USER: \${{ secrets.KOOFR_USERNAME || github.event.client_payload.koofr_username }}
+          KOOFR_PASS: \${{ secrets.KOOFR_APP_PASSWORD || github.event.client_payload.koofr_app_password }}
+        run: |
+          BASE_URL="\${{ steps.params.outputs.koofr_base_url }}"
+          VIDEO_NAME="\${{ steps.params.outputs.video_name }}"
+          BASENAME=\${VIDEO_NAME%.*}
+          
+          OUTPUT_DIR_URL="$BASE_URL/output/$BASENAME"
+
+          echo "Ensuring /output folder exists on WebDAV..."
+          # MKCOL for root /output if not present
+          curl -u "$KOOFR_USER:$KOOFR_PASS" -X MKCOL "$BASE_URL/output" || true
+          
+          # MKCOL for specific video output subfolder
+          echo "Creating directory $OUTPUT_DIR_URL"
+          curl -u "$KOOFR_USER:$KOOFR_PASS" -X MKCOL "$OUTPUT_DIR_URL" || true
+
+          # Upload every generated clip back to WebDAV
+          cd workspace/clips
+          for clip in *; do
+            if [ -f "$clip" ]; then
+              TARGET_FILE_URL="$OUTPUT_DIR_URL/$clip"
+              echo "Uploading $clip -> $TARGET_FILE_URL"
+              curl -f -u "$KOOFR_USER:$KOOFR_PASS" -T "$clip" "$TARGET_FILE_URL"
+            fi
+          done
+
+          echo "All clips successfully chopped and synced to Koofr WebDAV!"
+`;
+
+export const SETUP_STEPS = [
+  {
+    step: 1,
+    title: "Create the Workflow File in your GitHub Repository",
+    desc: "In your repository, create the path `.github/workflows/chop_video.yml` and paste the workflow content above.",
+  },
+  {
+    step: 2,
+    title: "Configure GitHub Repository Secrets (Optional but Recommended)",
+    desc: "Navigate to your GitHub Repo -> Settings -> Secrets and variables -> Actions -> New repository secret. Add `KOOFR_BASE_URL`, `KOOFR_USERNAME`, and `KOOFR_APP_PASSWORD` so you don't need to pass them on every dispatch call.",
+  },
+  {
+    step: 3,
+    title: "Generate GitHub Personal Access Token (PAT)",
+    desc: "Go to github.com/settings/tokens (classic or fine-grained). Grant `repo` scope (or Actions / Contents read & write permissions). Paste this token into the Settings Vault.",
+  },
+  {
+    step: 4,
+    title: "Upload Videos to Koofr WebDAV",
+    desc: "In Koofr, create an `/input` folder and place your raw videos (e.g. `podcast_ep1.mp4`). The app will find them automatically.",
+  },
+  {
+    step: 5,
+    title: "1-Click AI Extraction & GitHub Chopping",
+    desc: "Select the video, transcribe with Groq Whisper, generate viral clips with Gemini, and hit 'Dispatch Chopping Action'. Clips will be cut in seconds without consuming local RAM and saved into `/output/<video_name>/`!",
+  },
+];

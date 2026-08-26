@@ -1,0 +1,6 @@
+{
+  "name": "WebDAV Video Clip Orchestrator",
+  "description": "0-RAM serverless video moment extractor orchestrating Koofr WebDAV, Groq Whisper transcription, Gemini AI highlight detection, and GitHub Actions FFmpeg chopping.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
